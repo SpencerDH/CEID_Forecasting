@@ -1,0 +1,237 @@
+---
+title: "Influenza Summary"
+author: "Spencer D. Hall"
+date: "6/22/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, include=FALSE}
+
+source("~/Desktop/RCode/DrakeLab/Analogs/updated_general_functions.R")
+source("~/Desktop/RCode/DrakeLab/Analogs/analogs_function.R")
+library(dplyr)
+library(forecast)
+library(magrittr)
+library(ggplot2)
+library(reshape)
+
+data <- read.csv("/Users/spencerhall/Desktop/RCode/DrakeLab/MetaAnalysis/flu.csv") %>%
+	select(., City.Name, State, Year, Week.Number, P, I) %>% 
+	mutate(., PI = P + I) %>%
+	select(., -P, -I)
+
+
+```
+
+## General note on model fitting in all functions.
+
+All of the model-testing functions use roughly the same approach in fitting and
+predicting from models, so I am going to go ahead and make a note about their
+general structure as far as model-fitting goes to avoid repetition when
+describing each individual function.
+
+Each function that fits and predicts from a model has a few key characteristics:
+
+1. The function call includes a model_type argument. This is what tells the
+function what model to fit using general_fit(). The name of the model is
+inputted as a string just as it would be typed if the model were being
+called on its own, except without the characteristic function parentheses,
+e.g., "get_analogs", "Holt_Winters", or "auto.arima".
+2. The function call includes an ellipsis (...) argument. This argument takes
+whatever model-specific arguments need to be used in fitting the model in
+general_fit(). These model-specific arguments are inputted as strings in
+the ellipsis section, separated by commas. Inside of general_fit(), they are
+then converted into R objects and entered into the model function. An important
+caveat is that the variables with the names of these arguments must already be
+in R's working environment - for instance, if the model argument "start_year"
+is used, R must already have start_year as a known variable, or else general_fit()
+will not know what "start_year" refers to and will return an error.
+
+## Demonstrating general_fit().
+
+A problem that I have faced in writing the model-testing architecture is that R's
+time series functions (not to mention the ones I've written myself) take different
+enough arguments that fitting them within the model-testing functions can be a
+challenge. Several of the model-testing functions do require fitting functions
+repeatedly in the body of the functions - including ts_cv(), predict_and_plot(),
+and predict_with_noise(). Without a general model-fitting function, this creates
+a problem: in order to fit a given model in one of these functions, you must specify
+the model in the body of the function itself by hard-coding the model. If there are
+several models you might consider using, all of them would have to be hard-coded.
+Furthermore, the parameters for each of these models would either have to be 
+hard-coded as well, or passed as arguments to the functions, with each function 
+having arguments corresponding to all available parameters of all possible models
+we might consider using.
+
+Obviously, such an approach is impractical given our desire to have the flexibility
+to test an arbitrary number of different models; not to mention that this approach
+would be bad coding practice, as hard-coding should be avoided if at all possible.
+general_fit() solves this problem by serving as a wrapper for fitting a given model
+and then making a prediction for n steps ahead from that model. The function
+uses R's ellipsis argument to accommodate whatever arguments need to be passed
+to general_fit() for some specific model. (Examples below.)
+
+In addition, general_fit() actually performs the prediction for n steps ahead from
+the fitted model, using the forecast() function from Robert Hyndman's eponymous
+R package. This is useful because it avoids having to store the model object
+inside the model-testing function that calls general_fit(), so that the function
+can work directly with the forecasted values.
+
+```{r}
+
+# First, I take some time
+# series data from the CDC
+# influenza dataset we have.
+# This is the 2005 / 2006
+# influenza season in 
+# San Antonio.
+
+s <- c(14, 15, 13, 11, 11,
+	  12, 21, 10, 12, 12,
+	  13, 10, 14, 12, 17,
+	  27, 22, 43, 22, 20,
+	  21, 18, 32, 28, 37)
+
+train <- s[1:20]
+test <- s[21:25]
+
+# Now I fit an ARIMA model to the
+# training set using general_fit(),
+# and compare with the testing
+# set.
+
+best_q <- 2
+pred <- general_fit(train = train,
+		model_type = "auto.arima",
+		n = 6)
+		
+# Note that I use pred$mean and not
+# just pred. This is because pred is
+# a forecast object and as such has
+# several associated values, including
+# various confidence bounds. The
+# mean value is what is usually
+# used for the predicted value.
+compare <- data.frame(t = 21:25,
+		"Real Values" = test,
+		"Predicted" = pred$mean) %>%
+		melt(., id = "t")
+		
+ggplot(data = compare, aes(x = t, y = value, colour = variable)) +
+  geom_point() + geom_line() +
+  ggtitle("ARIMA Prediction With general_fit() Function")
+
+# Next, I fit a method of analogs
+# model to the same training set
+# and compare with the testing set.
+
+start_year <- 2005
+
+pred_2 <- general_fit(train = train,
+ 			model_type = "get_analogs",
+			n = 6, "start_year", "data")
+			
+compare_2 <- data.frame(t = 21:25,
+					"Real Values" = test,
+					"Predicted" = pred_2$mean[-length(pred_2$mean)]) %>%
+					melt(., id = "t")
+					
+ggplot(data = compare_2, aes(x = t, y = value, colour = variable)) +
+	geom_point() + geom_line() +
+  ggtitle("Analogs Prediction With general_fit() Function")
+
+
+```
+
+## Demonstrating predict_and_plot().
+
+The motivation behind predict_and_plot() is that we want to see how well a model performs
+at different lengths of time out from the target being predicted. This function takes in
+a time series vector s of length n, and extracts the training segment, which is the first
+k values of s. It then iteratively predicts the target week (the last value of s), obtains
+the absolute error of this prediction, (k + 1)st value and retrains and tests, then adds
+the (k + 2)nd value, and so on, until it trains and predicts on all n - 1 values before
+the target week. The absolute errors from all of these predictions are then plotted
+against the weeks in which the predictions were made.
+
+The purpose of this function is to examine how the performance of the model changes 
+as the training set gets closer to the target value. In general, we would expect (or
+at least hope) to see a general decline in error across the graph. This is more or less
+what we observe with the analogs graph below, but the ARIMA model does not perform as well,
+with no discernable overall average decline across the weeks of the predictions.
+
+```{r}
+
+best_q <- 10
+suppressWarnings(arima_pred_plot <- predict_and_plot(pi_vec = s, model_type = "auto.arima", 
+                                    k = 15,
+                                    with_bar = FALSE, "max.q = best_q"))
+                                    
+arima_pred_plot + ggtitle("predict_and_plot() - ARIMA")
+                                    
+start_year <- 2005
+suppressWarnings(analogs_pred_plot <- predict_and_plot(pi_vec = s, model_type = "get_analogs", 
+                                      k = 15,
+                                      with_bar = FALSE, "start_year", "data"))
+                                      
+analogs_pred_plot + ggtitle("predict_and_plot() - Analogs")
+
+```
+
+Demonstrating predict_with_noise().
+
+```{r}
+
+source("~/Desktop/RCode/DrakeLab/Analogs/updated_general_functions.R")
+source("~/Desktop/RCode/DrakeLab/Analogs/analogs_function.R")
+best_q <- 10
+suppressWarnings(arima_with_noise <- predict_with_noise(pi_vec = s, model_type = "auto.arima", 
+                                       steps_ahead = 5,
+                                       sigma = 2, seed = 1995, "max.q = best_q"))
+                                       
+arima_with_noise + ggtitle("predict_with_noise() - ARIMA")
+
+start_year <- 2005
+suppressWarnings(analogs_with_noise <- predict_with_noise(pi_vec = s, model_type = "get_analogs", 
+								steps_ahead = 5, sigma = 2,
+                seed = 1995, "start_year", "data"))
+                                         
+analogs_with_noise + ggtitle("predict_with_noise() - Analogs")
+
+```
+
+## Demonstrating ts_cv().
+
+```{r}
+
+pred_values <- vector()
+res <- vector()
+suppressWarnings(arima_cv <- ts_cv(pi_vec = s, train_length = 15, model_type = "auto.arima", k = 1, 
+                  type = "exp_fixed_k", change_by = NULL, type_transform = "none"))
+
+arima_cv + ggtitle("Rolling Cross-Validation - ARIMA")
+
+pred_values <- vector()
+res <- vector()
+suppressWarnings(analogs_cv <- ts_cv(pi_vec = s, train_length = 15, model_type = "get_analogs", k = 1,
+                    type = "exp_fixed_k", change_by = NULL, type_transform = "none",
+                    "start_year", "data"))
+
+analogs_cv + ggtitle("Rolling Cross-Validation - Analogs")
+
+```
+
+
+
+
+
+
+
+
+
+
+
